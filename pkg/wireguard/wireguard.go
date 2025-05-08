@@ -1,12 +1,15 @@
 package wireguard
 
 import (
+	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -217,6 +220,11 @@ func (wg *WireGuardManager) setupDarwin() error {
 	wgGoBinary := BinaryPath("wireguard-go")
 	wgBinary := BinaryPath("wg")
 
+	// Make sure we have a utun interface name on macOS
+	if !strings.HasPrefix(wg.interfaceName, "utun") {
+		return fmt.Errorf("on macOS, WireGuard interface name must start with 'utun' followed by a number")
+	}
+
 	// Generate a temporary configuration file
 	configFile, err := os.CreateTemp("", "wg-config-*.conf")
 	if err != nil {
@@ -237,28 +245,44 @@ ListenPort = %d
 
 	// Set up the WireGuard interface
 	cmd := exec.Command(wgGoBinary, wg.interfaceName)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create WireGuard interface: %v", err)
+	cmdOutput, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to create WireGuard interface: %v - %s", err, string(cmdOutput))
 	}
+
+	// Wait for the interface to be ready
+	time.Sleep(500 * time.Millisecond)
 
 	// Apply the configuration
 	cmd = exec.Command(wgBinary, "setconf", wg.interfaceName, configFile.Name())
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to configure WireGuard interface: %v", err)
+	cmdOutput, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to configure WireGuard interface: %v - %s", err, string(cmdOutput))
 	}
 
 	// Configure IP addresses
 	for _, addr := range wg.addresses {
-		cmd = exec.Command("ifconfig", wg.interfaceName, "inet", addr)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to configure IP address %s: %v", addr, err)
+		// Parse the CIDR notation to get IP and netmask
+		ipAddr, ipNet, err := net.ParseCIDR(addr)
+		if err != nil {
+			return fmt.Errorf("failed to parse IP address %s: %v", addr, err)
+		}
+
+		// Format for macOS ifconfig: ifconfig interface inet IP DEST netmask MASK
+		// For point-to-point interfaces like utun, both IP and destination are the same
+		cmd = exec.Command("ifconfig", wg.interfaceName, "inet", ipAddr.String(),
+			ipAddr.String(), "netmask", fmt.Sprintf("0x%x", binary.BigEndian.Uint32(ipNet.Mask)))
+		cmdOutput, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to configure IP address %s: %v - %s", addr, err, string(cmdOutput))
 		}
 	}
 
 	// Set interface up
 	cmd = exec.Command("ifconfig", wg.interfaceName, "up")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set interface up: %v", err)
+	cmdOutput, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to set interface up: %v - %s", err, string(cmdOutput))
 	}
 
 	return nil

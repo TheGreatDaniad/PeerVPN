@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,15 +20,28 @@ import (
 )
 
 const (
-	interfaceName = "peervpn0"
-	clientSubnet  = "10.0.0.0/24"
+	clientSubnet = "10.0.0.0/24"
 )
 
 var (
+	// Platform-specific interface name
+	interfaceName  = getDefaultInterfaceName()
 	configDir      = getConfigDir()
 	configFilePath = filepath.Join(configDir, "config.json")
 	peerInfoPath   = filepath.Join(configDir, "peer_info.txt")
 )
+
+// getDefaultInterfaceName returns the default interface name based on the OS
+func getDefaultInterfaceName() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "utun8" // On macOS, interface name must be utun[0-9]*
+	case "windows":
+		return "peervpn" // On Windows, can be any name
+	default:
+		return "peervpn0" // On Linux, can be any name
+	}
+}
 
 func getConfigDir() string {
 	homeDir, err := os.UserHomeDir()
