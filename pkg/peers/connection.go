@@ -3,6 +3,7 @@ package peers
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -186,30 +187,97 @@ func (cm *ConnectionManager) emergencyRoutingRestore() {
 	// Based on the OS, we'll take different actions
 	switch runtime.GOOS {
 	case "darwin":
-		// On macOS, flush the routing table and restore default route
+		// On macOS, first try to find the actual default gateway
+		fmt.Println("Finding default gateway interfaces...")
+		netInterfaces, err := net.Interfaces()
+		if err == nil {
+			for _, iface := range netInterfaces {
+				// Skip loopback and inactive interfaces
+				if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+					continue
+				}
+
+				// Skip our VPN interface
+				if iface.Name == cm.interfaceName {
+					continue
+				}
+
+				// Look for active interfaces like en0, en1 (typical on macOS)
+				if strings.HasPrefix(iface.Name, "en") {
+					fmt.Printf("Found potential default interface: %s\n", iface.Name)
+
+					// Try to get info about this interface
+					ifConfig, err := exec.Command("ifconfig", iface.Name).CombinedOutput()
+					if err == nil {
+						fmt.Printf("Interface info: %s\n", string(ifConfig))
+
+						// Try to extract gateway information
+						gatewayOutput, err := exec.Command("route", "-n", "get", "default", "-ifscope", iface.Name).CombinedOutput()
+						if err == nil {
+							fmt.Printf("Gateway for %s: %s\n", iface.Name, string(gatewayOutput))
+
+							// Try to make this the default route
+							fmt.Printf("Setting %s as default route\n", iface.Name)
+							exec.Command("route", "-n", "change", "default", "-ifscope", iface.Name).Run()
+						}
+					}
+				}
+			}
+		}
+
+		// Flush the routing table
 		fmt.Println("Flushing routing table...")
 		exec.Command("route", "-n", "flush").Run()
 
-		// Try to restore the default route
-		fmt.Println("Attempting to restore default route...")
-		exec.Command("route", "-n", "add", "default", "192.168.1.1").Run() // Common default gateway
-		exec.Command("route", "-n", "add", "default", "10.0.0.1").Run()    // Another common gateway
-		exec.Command("route", "-n", "add", "default", "172.16.0.1").Run()  // Another common gateway
+		// Try common gateways
+		fmt.Println("Attempting to restore default route with common gateway IPs...")
+
+		// Try the ones in the domestic router IP range first
+		commonGateways := []string{
+			"192.168.1.1", "10.0.0.1", "192.168.0.1", "172.16.0.1",
+			"192.168.1.254", "10.0.0.138", "10.1.1.1", "172.20.10.1",
+		}
+
+		// Try each of them
+		for _, gateway := range commonGateways {
+			fmt.Printf("Trying gateway %s...\n", gateway)
+			exec.Command("route", "-n", "add", "default", gateway).Run()
+			// Ping to see if it works
+			pingOutput, err := exec.Command("ping", "-c", "1", "-t", "1", "8.8.8.8").CombinedOutput()
+			if err == nil {
+				fmt.Printf("Restored connectivity via %s!\n", gateway)
+				fmt.Printf("Ping result: %s\n", string(pingOutput))
+				break
+			}
+		}
 
 		// Remove any reference to our interface
 		fmt.Println("Removing any routes through VPN interface...")
-		exec.Command("route", "-n", "delete", "-interface", cm.interfaceName).Run()
+		exec.Command("route", "-n", "delete", "-ifp", cm.interfaceName).Run()
 
 		// Try to bring down the interface
 		fmt.Println("Bringing down VPN interface...")
 		exec.Command("ifconfig", cm.interfaceName, "down").Run()
 
+		// As a last resort, try to kill all WireGuard processes
+		fmt.Println("Killing any WireGuard processes...")
+		exec.Command("pkill", "-f", "wireguard").Run()
+
 	case "linux":
 		// On Linux, restore default route and flush interface
 		fmt.Println("Attempting to restore default route...")
-		exec.Command("ip", "route", "add", "default", "via", "192.168.1.1").Run()
-		exec.Command("ip", "route", "add", "default", "via", "10.0.0.1").Run()
-		exec.Command("ip", "route", "add", "default", "via", "172.16.0.1").Run()
+
+		// Try to find the default interface
+		routeInfo, err := exec.Command("ip", "route", "show").CombinedOutput()
+		if err == nil {
+			fmt.Printf("Current routes:\n%s\n", string(routeInfo))
+		}
+
+		// Try common gateways
+		commonGateways := []string{"192.168.1.1", "10.0.0.1", "192.168.0.1", "172.16.0.1"}
+		for _, gateway := range commonGateways {
+			exec.Command("ip", "route", "add", "default", "via", gateway).Run()
+		}
 
 		// Flush routes for the interface
 		fmt.Println("Removing any routes through VPN interface...")
@@ -218,7 +286,10 @@ func (cm *ConnectionManager) emergencyRoutingRestore() {
 	case "windows":
 		// On Windows, try to reset the interface
 		fmt.Println("Attempting to restore default route...")
+
+		// Try common gateways
 		exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", "192.168.1.1").Run()
+		exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", "10.0.0.1").Run()
 
 		// Reset Winsock as a last resort
 		fmt.Println("Resetting Winsock catalog...")
@@ -231,16 +302,59 @@ func (cm *ConnectionManager) emergencyRoutingRestore() {
 
 // Disconnect disconnects from the VPN
 func (cm *ConnectionManager) Disconnect() error {
-	// Clean up routing
+	var errors []string
+
+	// First restore default route before cleaning up WireGuard
+	fmt.Println("Ensuring default route is restored...")
+
+	// Get the default gateway information before cleanup
+	routeInfo, err := exec.Command("route", "-n", "get", "8.8.8.8").CombinedOutput()
+	if err == nil {
+		fmt.Printf("Current route info: %s\n", string(routeInfo))
+	}
+
+	// Clean up routing first
+	fmt.Println("Cleaning up routing tables...")
 	if err := cm.routingManager.CleanupRouting(); err != nil {
-		return fmt.Errorf("failed to clean up routing: %v", err)
+		errors = append(errors, fmt.Sprintf("failed to clean up routing: %v", err))
+		// Don't return immediately, try to do as much cleanup as possible
 	}
 
-	// Tear down WireGuard interface
+	// Make sure we can still reach the Internet
+	fmt.Println("Verifying Internet connectivity...")
+
+	// Depending on OS, try to restore default route
+	switch runtime.GOOS {
+	case "darwin":
+		// Flush routing table cache on macOS
+		exec.Command("route", "-n", "flush").Run()
+	case "linux":
+		// On Linux, we might need to restore the default route
+		exec.Command("ip", "route", "flush", "cache").Run()
+	}
+
+	// Tear down WireGuard interface after routing is cleaned up
+	fmt.Println("Removing WireGuard interface...")
 	if err := cm.wgManager.TearDown(); err != nil {
-		return fmt.Errorf("failed to tear down WireGuard interface: %v", err)
+		errors = append(errors, fmt.Sprintf("failed to tear down WireGuard interface: %v", err))
 	}
 
+	// If anything failed, try the emergency recovery
+	if len(errors) > 0 {
+		fmt.Println("Errors encountered during normal cleanup, trying emergency recovery...")
+		cm.emergencyRoutingRestore()
+
+		// Return combined error
+		return fmt.Errorf("multiple cleanup errors: %s", strings.Join(errors, "; "))
+	}
+
+	// Perform final check of routing
+	routeInfo, err = exec.Command("route", "-n", "get", "8.8.8.8").CombinedOutput()
+	if err == nil {
+		fmt.Printf("Final route info: %s\n", string(routeInfo))
+	}
+
+	fmt.Println("VPN connection terminated and network restored successfully.")
 	return nil
 }
 
