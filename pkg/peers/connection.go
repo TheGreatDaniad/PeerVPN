@@ -3,8 +3,13 @@ package peers
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
+
+	"bufio"
 
 	"github.com/danialdehvan/PeerVPN/pkg/nat"
 	"github.com/danialdehvan/PeerVPN/pkg/routing"
@@ -44,6 +49,20 @@ func NewConnectionManager(
 
 // ConnectToPeer connects to a peer using their public key and endpoint
 func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) error {
+	// Setup cleanup function to ensure internet connectivity is preserved on any failure
+	connectionSuccess := false
+	defer func() {
+		// Only run cleanup if we didn't succeed
+		if !connectionSuccess {
+			fmt.Println("Cleaning up after failed connection...")
+			if err := cm.Disconnect(); err != nil {
+				fmt.Printf("Warning: Error during cleanup: %v\n", err)
+				// Try more aggressive cleanup
+				cm.emergencyRoutingRestore()
+			}
+		}
+	}()
+
 	fmt.Println("=== Connection Process Started ===")
 
 	// Set up WireGuard interface if needed
@@ -83,20 +102,14 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 	}
 	fmt.Println("   ✓ Peer added to WireGuard configuration")
 
-	// Set up routing
-	fmt.Println("4. Setting up routing tables...")
-	if err := cm.routingManager.SetupRouting(cm.clientSubnet); err != nil {
-		return fmt.Errorf("failed to set up routing: %v", err)
-	}
-	fmt.Println("   ✓ Routing tables configured")
-
-	// Start connection tracking for clients too
-	fmt.Println("5. Starting connection monitoring...")
+	// Setup is complete, but we don't set up routing until connection is confirmed
+	// This is to ensure we don't break internet connectivity if the connection fails
+	fmt.Println("4. Starting connection monitoring...")
 	cm.StartConnectionTracking(5 * time.Second)
 	fmt.Println("   ✓ Connection monitoring started")
 
 	// Wait and verify that we actually establish a connection
-	fmt.Println("6. Verifying connection to peer...")
+	fmt.Println("5. Verifying connection to peer...")
 	handshakeTimeout := 15 * time.Second
 	handshakeSuccess := false
 
@@ -116,9 +129,8 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 		case <-ctx.Done():
 			// Timeout occurred
 			if !handshakeSuccess {
-				// Clean up the routing and interface before returning
+				// Do not set up routing, just clean up and exit
 				fmt.Println("   ✗ Connection timed out - no handshake with peer")
-				cm.Disconnect()
 				return fmt.Errorf("connection timed out - could not establish handshake with peer at %s", peerEndpoint)
 			}
 			break
@@ -149,13 +161,72 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 
 handshakeDone:
 	if handshakeSuccess {
+		// Only set up routing after confirming handshake
+		fmt.Println("6. Setting up routing tables...")
+		if err := cm.routingManager.SetupRouting(cm.clientSubnet); err != nil {
+			return fmt.Errorf("failed to set up routing: %v", err)
+		}
+		fmt.Println("   ✓ Routing tables configured")
+
 		fmt.Println("=== Connection Process Complete ===")
 		fmt.Println("Traffic is now routed through the exit node.")
+		connectionSuccess = true
 		return nil
 	} else {
 		fmt.Println("=== Connection Process Failed ===")
 		return fmt.Errorf("connection timed out - could not establish handshake with peer at %s", peerEndpoint)
 	}
+}
+
+// emergencyRoutingRestore tries to restore normal internet connectivity
+// after a connection failure by directly manipulating routing tables
+func (cm *ConnectionManager) emergencyRoutingRestore() {
+	fmt.Println("EMERGENCY: Attempting to restore network connectivity...")
+
+	// Based on the OS, we'll take different actions
+	switch runtime.GOOS {
+	case "darwin":
+		// On macOS, flush the routing table and restore default route
+		fmt.Println("Flushing routing table...")
+		exec.Command("route", "-n", "flush").Run()
+
+		// Try to restore the default route
+		fmt.Println("Attempting to restore default route...")
+		exec.Command("route", "-n", "add", "default", "192.168.1.1").Run() // Common default gateway
+		exec.Command("route", "-n", "add", "default", "10.0.0.1").Run()    // Another common gateway
+		exec.Command("route", "-n", "add", "default", "172.16.0.1").Run()  // Another common gateway
+
+		// Remove any reference to our interface
+		fmt.Println("Removing any routes through VPN interface...")
+		exec.Command("route", "-n", "delete", "-interface", cm.interfaceName).Run()
+
+		// Try to bring down the interface
+		fmt.Println("Bringing down VPN interface...")
+		exec.Command("ifconfig", cm.interfaceName, "down").Run()
+
+	case "linux":
+		// On Linux, restore default route and flush interface
+		fmt.Println("Attempting to restore default route...")
+		exec.Command("ip", "route", "add", "default", "via", "192.168.1.1").Run()
+		exec.Command("ip", "route", "add", "default", "via", "10.0.0.1").Run()
+		exec.Command("ip", "route", "add", "default", "via", "172.16.0.1").Run()
+
+		// Flush routes for the interface
+		fmt.Println("Removing any routes through VPN interface...")
+		exec.Command("ip", "route", "flush", "dev", cm.interfaceName).Run()
+
+	case "windows":
+		// On Windows, try to reset the interface
+		fmt.Println("Attempting to restore default route...")
+		exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", "192.168.1.1").Run()
+
+		// Reset Winsock as a last resort
+		fmt.Println("Resetting Winsock catalog...")
+		exec.Command("netsh", "winsock", "reset").Run()
+	}
+
+	fmt.Println("Emergency network restoration attempted.")
+	fmt.Println("If you still have connectivity issues, please restart your computer.")
 }
 
 // Disconnect disconnects from the VPN
@@ -333,4 +404,80 @@ func formatDuration(d time.Duration) string {
 	} else {
 		return fmt.Sprintf("%.1f seconds", d.Seconds())
 	}
+}
+
+// EnableConnectionDebugging starts additional diagnostics to monitor incoming connection attempts
+func (cm *ConnectionManager) EnableConnectionDebugging() {
+	// Get the WireGuard port
+	wgPort := cm.wgManager.GetListenPort()
+
+	fmt.Printf("\n=== Enabling Advanced Connection Debugging (Port: %d) ===\n", wgPort)
+
+	// Start tcpdump in the background to capture WireGuard packets
+	go func() {
+		// Run tcpdump for UDP traffic on the WireGuard port
+		portStr := fmt.Sprintf("port %d", wgPort)
+		cmd := exec.Command("tcpdump", "-i", "any", "-n", "udp", "and", portStr)
+
+		// Set up pipes for output
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			fmt.Printf("Error setting up packet capture: %v\n", err)
+			return
+		}
+
+		cmd.Stderr = os.Stderr
+
+		// Start tcpdump
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("Error starting packet capture: %v\n", err)
+			return
+		}
+
+		fmt.Println("Packet monitoring started - watching for WireGuard traffic")
+
+		// Read output and print
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Printf("PACKET: %s\n", line)
+		}
+
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("Error reading packet capture: %v\n", err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			fmt.Printf("Packet capture ended: %v\n", err)
+		}
+	}()
+
+	// Run periodic connection info dumps to see more detailed WireGuard info
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		wgBinary := wireguard.BinaryPath("wg")
+
+		for {
+			<-ticker.C
+
+			fmt.Println("\n=== WireGuard Connection Debug Info ===")
+			output, err := exec.Command(wgBinary, "show", cm.interfaceName, "dump").CombinedOutput()
+			if err == nil {
+				fmt.Printf("Raw connection data: %s\n", string(output))
+			}
+
+			netstatOutput, err := exec.Command("netstat", "-an").CombinedOutput()
+			if err == nil {
+				lines := strings.Split(string(netstatOutput), "\n")
+				for _, line := range lines {
+					// Only show lines with our WireGuard port
+					if strings.Contains(line, fmt.Sprintf(":%d", wgPort)) {
+						fmt.Printf("Connection state: %s\n", line)
+					}
+				}
+			}
+		}
+	}()
 }

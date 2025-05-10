@@ -75,11 +75,13 @@ func main() {
 		isExitNode  bool
 		showInfo    bool
 		connectPeer string
+		debugMode   bool
 	)
 
 	flag.BoolVar(&isExitNode, "exit", false, "Run as an exit node")
 	flag.BoolVar(&showInfo, "info", false, "Show peer connection information")
 	flag.StringVar(&connectPeer, "connect", "", "Connect to a peer (format: pubkey@endpoint)")
+	flag.BoolVar(&debugMode, "debug", false, "Enable detailed connection debugging")
 	flag.Parse()
 
 	// Create config directory if it doesn't exist
@@ -162,6 +164,12 @@ func main() {
 			fmt.Println("\n=== Easy Connect String (Copy & Paste) ===")
 			fmt.Println(connString)
 			fmt.Println("\nTo connect, run: sudo ./peervpn --connect=" + connString)
+		}
+
+		// Enable detailed connection debugging if requested
+		if debugMode {
+			fmt.Println("\nDebug mode enabled - detailed connection monitoring will be shown")
+			connectionManager.EnableConnectionDebugging()
 		}
 
 		// Set up signal handling

@@ -101,10 +101,55 @@ func (ct *ConnTracker) StopTracking() {
 
 // UpdateStats updates the statistics for all connected peers
 func (ct *ConnTracker) UpdateStats() []*PeerStats {
-	// Use the BinaryPath function to locate the wg tool
 	wgBinary := wireguard.BinaryPath("wg")
 
-	// Use the right binary path
+	// First run a command to capture more raw details including recent handshake attempts
+	fmt.Println("\n=== Connection Monitor: Checking for connection attempts ===")
+	rawOutput, err := exec.Command(wgBinary, "show", ct.interfaceName).CombinedOutput()
+	if err != nil {
+		fmt.Printf("Connection tracker: Error getting raw WireGuard info: %v\n", err)
+	} else {
+		// Parse and look for interesting patterns in the raw output
+		rawLines := strings.Split(string(rawOutput), "\n")
+		for _, line := range rawLines {
+			line = strings.TrimSpace(line)
+			// Look for handshake attempts or any traffic indicators
+			if strings.Contains(line, "handshake") {
+				fmt.Printf("Handshake activity: %s\n", line)
+			} else if strings.Contains(line, "endpoint") {
+				fmt.Printf("Peer endpoint: %s\n", line)
+			} else if strings.Contains(line, "transfer") {
+				fmt.Printf("Traffic activity: %s\n", line)
+			}
+		}
+	}
+
+	// Get UDP connection statistics (useful for seeing raw connection attempts)
+	connStats, err := exec.Command("netstat", "-u").CombinedOutput()
+	if err == nil {
+		udpConns := strings.Split(string(connStats), "\n")
+		fmt.Println("\n=== UDP Connection Monitor ===")
+
+		// Filter for the WireGuard interface port
+		var relevantLines []string
+		for _, line := range udpConns {
+			// Add all non-empty UDP connections with "wg" or the interface name or "*"
+			if strings.Contains(line, "udp") && (strings.Contains(line, "wg") ||
+				strings.Contains(line, ct.interfaceName) || strings.Contains(line, "*")) {
+				relevantLines = append(relevantLines, line)
+			}
+		}
+
+		if len(relevantLines) > 0 {
+			for _, line := range relevantLines {
+				fmt.Println(line)
+			}
+		} else {
+			fmt.Println("No relevant UDP connections found")
+		}
+	}
+
+	// Capture raw WireGuard dump output for connection analysis
 	output, err := exec.Command(wgBinary, "show", ct.interfaceName, "dump").Output()
 	if err != nil {
 		// Log the error to help diagnose issues
@@ -162,7 +207,7 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 		peer, exists := ct.peers[publicKey]
 		if !exists {
 			// New peer connection
-			fmt.Printf("Connection tracker: New peer detected with key %s at endpoint %s\n",
+			fmt.Printf("CONNECTION ATTEMPT: New peer with key %s trying to connect from %s\n",
 				publicKey[:8]+"...", endpoint)
 			peer = &PeerStats{
 				PublicKey: publicKey,
@@ -177,7 +222,7 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 
 		// Check if the endpoint changed
 		if exists && peer.Endpoint != endpoint && endpoint != "(none)" {
-			fmt.Printf("Connection tracker: Peer endpoint changed from %s to %s\n",
+			fmt.Printf("CONNECTION ATTEMPT: Peer endpoint changed from %s to %s\n",
 				peer.Endpoint, endpoint)
 		}
 
@@ -187,7 +232,7 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 			txDelta := bytesSent - peer.BytesSent
 
 			if rxDelta > 0 || txDelta > 0 {
-				fmt.Printf("Connection tracker: Traffic with peer %s: +%s received, +%s sent\n",
+				fmt.Printf("CONNECTION ACTIVITY: Traffic with peer %s: +%s received, +%s sent\n",
 					endpoint, FormatTrafficBytes(rxDelta), FormatTrafficBytes(txDelta))
 			}
 		}
@@ -195,7 +240,7 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 		// Show handshake status
 		if wasNewHandshake {
 			sinceLastHandshake := time.Since(handshakeTime)
-			fmt.Printf("Connection tracker: Peer %s handshake %s ago\n",
+			fmt.Printf("CONNECTION SUCCESS: Handshake with peer %s %s ago\n",
 				endpoint, humanDuration(sinceLastHandshake))
 		}
 
@@ -211,10 +256,10 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 		// Detect new connections or reconnections
 		if wasNewHandshake && !exists {
 			// This is a newly connected peer
-			fmt.Printf("\n[%s] New peer connected: %s\n", time.Now().Format("15:04:05"), endpoint)
+			fmt.Printf("\n[%s] CONNECTION SUCCESS: New peer connected: %s\n", time.Now().Format("15:04:05"), endpoint)
 		} else if wasNewHandshake && exists && peer.Endpoint != endpoint {
 			// This is a reconnection with a different endpoint
-			fmt.Printf("\n[%s] Peer reconnected: %s (previously %s)\n",
+			fmt.Printf("\n[%s] CONNECTION CHANGE: Peer reconnected: %s (previously %s)\n",
 				time.Now().Format("15:04:05"), endpoint, peer.Endpoint)
 		}
 	}
@@ -222,7 +267,7 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 	// Detect and report disconnected peers
 	for key, peer := range ct.peers {
 		if !currentPeers[key] {
-			fmt.Printf("\n[%s] Peer disconnected: %s\n", time.Now().Format("15:04:05"), peer.Endpoint)
+			fmt.Printf("\n[%s] DISCONNECTION: Peer disconnected: %s\n", time.Now().Format("15:04:05"), peer.Endpoint)
 			delete(ct.peers, key)
 		}
 	}
