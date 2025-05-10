@@ -23,13 +23,22 @@ func (e Endpoint) String() string {
 // DiscoveryClient handles NAT traversal discovery
 type DiscoveryClient struct {
 	stunServers []string
+	localPort   int
 }
 
 // NewDiscoveryClient creates a new NAT discovery client
 func NewDiscoveryClient(stunServers []string) *DiscoveryClient {
 	return &DiscoveryClient{
 		stunServers: stunServers,
+		localPort:   0, // 0 means any available port
 	}
+}
+
+// SetLocalPort sets the local port for the DiscoveryClient
+// This ensures that STUN uses the same port that WireGuard is using
+func (c *DiscoveryClient) SetLocalPort(port int) {
+	c.localPort = port
+	fmt.Printf("STUN client will use local port %d for NAT detection\n", port)
 }
 
 // DiscoverPublicEndpoint attempts to discover the public endpoint using STUN
@@ -61,12 +70,47 @@ func (c *DiscoveryClient) DiscoverPublicEndpoint(ctx context.Context) (Endpoint,
 func (c *DiscoveryClient) discoverWithServer(serverAddr string) (Endpoint, error) {
 	var endpoint Endpoint
 
-	// Create a connection to the STUN server
-	conn, err := net.Dial("udp4", serverAddr)
-	if err != nil {
-		return endpoint, fmt.Errorf("failed to connect to STUN server %s: %v", serverAddr, err)
+	// Create a connection to the STUN server, binding to our specified local port if set
+	var conn net.Conn
+	var err error
+
+	if c.localPort > 0 {
+		// Create a specific local address to bind to
+		localAddr := &net.UDPAddr{
+			IP:   net.ParseIP("0.0.0.0"),
+			Port: c.localPort,
+		}
+
+		// Resolve the STUN server address
+		stunAddr, err := net.ResolveUDPAddr("udp4", serverAddr)
+		if err != nil {
+			return endpoint, fmt.Errorf("failed to resolve STUN server address %s: %v", serverAddr, err)
+		}
+
+		// Create a connection with the specific local address
+		conn, err = net.DialUDP("udp4", localAddr, stunAddr)
+		if err != nil {
+			fmt.Printf("Warning: Failed to bind to local port %d for STUN: %v\n", c.localPort, err)
+			// Fall back to any port
+			conn, err = net.Dial("udp4", serverAddr)
+			if err != nil {
+				return endpoint, fmt.Errorf("failed to connect to STUN server %s: %v", serverAddr, err)
+			}
+		} else {
+			fmt.Printf("Successfully bound to local port %d for STUN\n", c.localPort)
+		}
+	} else {
+		// Use any available port
+		conn, err = net.Dial("udp4", serverAddr)
+		if err != nil {
+			return endpoint, fmt.Errorf("failed to connect to STUN server %s: %v", serverAddr, err)
+		}
 	}
 	defer conn.Close()
+
+	// Get the local address we're using
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	fmt.Printf("Using local port %d for STUN discovery\n", localAddr.Port)
 
 	// Set a timeout for the STUN request
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -104,6 +148,9 @@ func (c *DiscoveryClient) discoverWithServer(serverAddr string) (Endpoint, error
 
 	endpoint.IP = xorAddr.IP
 	endpoint.Port = xorAddr.Port
+
+	fmt.Printf("STUN server %s reports public endpoint: %s:%d\n",
+		serverAddr, endpoint.IP.String(), endpoint.Port)
 
 	return endpoint, nil
 }

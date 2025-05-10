@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -35,7 +36,23 @@ var (
 func getDefaultInterfaceName() string {
 	switch runtime.GOOS {
 	case "darwin":
-		return "utun8" // On macOS, interface name must be utun[0-9]*
+		// For macOS, try to find an available utun interface name
+		// Start with utun12 and try higher numbers if occupied
+		baseNum := 12
+		maxTries := 10
+
+		for i := 0; i < maxTries; i++ {
+			ifName := fmt.Sprintf("utun%d", baseNum+i)
+			// Check if this interface already exists
+			_, err := exec.Command("ifconfig", ifName).CombinedOutput()
+			if err != nil {
+				// Interface doesn't exist, so it's available
+				return ifName
+			}
+			// Try the next number
+		}
+		// If we couldn't find a free one, return a fallback
+		return "utun20"
 	case "windows":
 		return "peervpn" // On Windows, can be any name
 	default:
@@ -139,8 +156,56 @@ func main() {
 		fmt.Println("Exit node is ready. Share the following information with clients:")
 		fmt.Println(connectionManager.GetConnectionInfo())
 
-		// Wait for interrupt signal
-		waitForInterrupt(connectionManager)
+		// Display the connection string for easy copying
+		connString := connectionManager.GetConnectionString()
+		if connString != "" {
+			fmt.Println("\n=== Easy Connect String (Copy & Paste) ===")
+			fmt.Println(connString)
+			fmt.Println("\nTo connect, run: sudo ./peervpn --connect=" + connString)
+		}
+
+		// Set up signal handling
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+		// Start tracking connections
+		fmt.Println("\nWaiting for peer connections...")
+		connectionManager.StartConnectionTracking(5 * time.Second)
+
+		// Start a ticker to display peer stats every 10 seconds
+		statsDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			defer close(statsDone)
+
+			for {
+				select {
+				case <-ticker.C:
+					connectionManager.DisplayPeerStats()
+				case <-sigCh: // Will be triggered when sigCh receives a signal
+					return
+				}
+			}
+		}()
+
+		// Wait for termination signal
+		<-sigCh
+		fmt.Println("\nShutting down...")
+
+		// Stop tracking before disconnecting
+		connectionManager.StopConnectionTracking()
+
+		// Clean up
+		if err := connectionManager.Disconnect(); err != nil {
+			fmt.Printf("Error during cleanup: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Wait for stats goroutine to finish
+		<-statsDone
+
+		fmt.Println("Disconnected successfully.")
 	} else if connectPeer != "" {
 		// Connect to a peer
 		fmt.Printf("Connecting to peer: %s\n", connectPeer)
@@ -168,11 +233,21 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Println("Connected to peer successfully.")
-		fmt.Println("Traffic is now routed through the exit node.")
+		// Set up signal handling
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-		// Wait for interrupt signal
-		waitForInterrupt(connectionManager)
+		// Wait for termination signal
+		<-sigCh
+		fmt.Println("\nShutting down...")
+
+		// Clean up
+		if err := connectionManager.Disconnect(); err != nil {
+			fmt.Printf("Error during cleanup: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("Disconnected successfully.")
 	} else {
 		// No mode specified
 		fmt.Println("PeerVPN - WireGuard-based P2P VPN")
@@ -236,22 +311,4 @@ func loadOrCreatePeerInfo(cfg *config.Config) (*peers.PeerInfo, error) {
 	}
 
 	return peerInfo, nil
-}
-
-func waitForInterrupt(connectionManager *peers.ConnectionManager) {
-	// Set up signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for termination signal
-	<-sigCh
-	fmt.Println("\nShutting down...")
-
-	// Clean up
-	if err := connectionManager.Disconnect(); err != nil {
-		fmt.Printf("Error during cleanup: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Disconnected successfully.")
 }
