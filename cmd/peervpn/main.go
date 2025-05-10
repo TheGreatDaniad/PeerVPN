@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -76,12 +77,18 @@ func main() {
 		showInfo    bool
 		connectPeer string
 		debugMode   bool
+		connTimeout int
+		retryCount  int
+		diagnostics bool
 	)
 
 	flag.BoolVar(&isExitNode, "exit", false, "Run as an exit node")
 	flag.BoolVar(&showInfo, "info", false, "Show peer connection information")
 	flag.StringVar(&connectPeer, "connect", "", "Connect to a peer (format: pubkey@endpoint)")
 	flag.BoolVar(&debugMode, "debug", false, "Enable detailed connection debugging")
+	flag.IntVar(&connTimeout, "timeout", 15, "Connection handshake timeout in seconds")
+	flag.IntVar(&retryCount, "retry", 1, "Number of connection attempts before giving up")
+	flag.BoolVar(&diagnostics, "diagnostics", false, "Run network diagnostics to troubleshoot connectivity issues")
 	flag.Parse()
 
 	// Create config directory if it doesn't exist
@@ -122,6 +129,13 @@ func main() {
 		interfaceName,
 		clientSubnet,
 	)
+
+	// Handle diagnostics mode
+	if diagnostics {
+		fmt.Println("=== PeerVPN Network Diagnostics ===")
+		runNetworkDiagnostics(connectionManager, natDiscovery)
+		os.Exit(0)
+	}
 
 	// Handle different modes
 	if showInfo {
@@ -235,9 +249,36 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Connect to the peer
-		if err := connectionManager.ConnectToPeer(peerPublicKey, validEndpoint); err != nil {
-			fmt.Printf("Error connecting to peer: %v\n", err)
+		// Use the provided timeout
+		fmt.Printf("Connection timeout set to %d seconds\n", connTimeout)
+		connectionManager.SetHandshakeTimeout(time.Duration(connTimeout) * time.Second)
+
+		// Enable debug mode if requested
+		if debugMode {
+			fmt.Println("Debug mode enabled - detailed connection information will be shown")
+			connectionManager.EnableConnectionDebugging()
+		}
+
+		// Attempt connection with retries
+		var connectErr error
+		for attempt := 1; attempt <= retryCount; attempt++ {
+			if attempt > 1 {
+				fmt.Printf("\n=== Retry Attempt %d of %d ===\n", attempt, retryCount)
+				// Give some time between retries
+				time.Sleep(2 * time.Second)
+			}
+
+			// Connect to the peer
+			connectErr = connectionManager.ConnectToPeer(peerPublicKey, validEndpoint)
+			if connectErr == nil {
+				break // Connection successful
+			}
+
+			fmt.Printf("Connection attempt %d failed: %v\n", attempt, connectErr)
+		}
+
+		if connectErr != nil {
+			fmt.Printf("All connection attempts failed. Last error: %v\n", connectErr)
 			os.Exit(1)
 		}
 
@@ -261,6 +302,10 @@ func main() {
 		fmt.Println("PeerVPN - WireGuard-based P2P VPN")
 		fmt.Println("Use --exit to run as an exit node")
 		fmt.Println("Use --connect=pubkey@endpoint to connect to a peer")
+		fmt.Println("   Options:")
+		fmt.Println("     --timeout=N      Set handshake timeout in seconds (default: 15)")
+		fmt.Println("     --retry=N        Number of connection attempts (default: 1)")
+		fmt.Println("     --debug          Enable detailed connection information")
 		fmt.Println("Use --info to show your connection information")
 		os.Exit(0)
 	}
@@ -319,4 +364,98 @@ func loadOrCreatePeerInfo(cfg *config.Config) (*peers.PeerInfo, error) {
 	}
 
 	return peerInfo, nil
+}
+
+// runNetworkDiagnostics performs various network connectivity tests
+func runNetworkDiagnostics(cm *peers.ConnectionManager, natDiscovery *nat.DiscoveryClient) {
+	fmt.Println("Running comprehensive network diagnostics...")
+
+	// 1. Check OS and version
+	fmt.Println("\n1. Operating System")
+	fmt.Printf("OS: %s\n", runtime.GOOS)
+	osVersionCmd := exec.Command("uname", "-a")
+	output, _ := osVersionCmd.CombinedOutput()
+	fmt.Printf("Version: %s", string(output))
+
+	// 2. Check network interfaces
+	fmt.Println("\n2. Network Interfaces")
+	ifconfigCmd := exec.Command("ifconfig")
+	output, _ = ifconfigCmd.CombinedOutput()
+	fmt.Printf("%s\n", string(output))
+
+	// 3. Check firewall status
+	fmt.Println("\n3. Firewall Status")
+	if runtime.GOOS == "darwin" {
+		pfctlCmd := exec.Command("pfctl", "-s", "info")
+		output, _ = pfctlCmd.CombinedOutput()
+		fmt.Printf("PF Firewall: %s\n", string(output))
+
+		// Check if our PeerVPN anchor exists
+		pfAnchorCmd := exec.Command("pfctl", "-s", "Anchors")
+		output, _ = pfAnchorCmd.CombinedOutput()
+		fmt.Printf("PF Anchors: %s\n", string(output))
+	} else if runtime.GOOS == "linux" {
+		iptablesCmd := exec.Command("iptables", "-L")
+		output, _ = iptablesCmd.CombinedOutput()
+		fmt.Printf("iptables: %s\n", string(output))
+	}
+
+	// 4. Check routing table
+	fmt.Println("\n4. Routing Table")
+	var routeCmd *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		routeCmd = exec.Command("netstat", "-nr")
+	} else {
+		routeCmd = exec.Command("ip", "route", "show")
+	}
+	output, _ = routeCmd.CombinedOutput()
+	fmt.Printf("%s\n", string(output))
+
+	// 5. Check UDP connectivity
+	fmt.Println("\n5. UDP Connectivity")
+	// Try to bind to common WireGuard port
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 51820})
+	if err != nil {
+		fmt.Printf("Cannot bind to UDP port 51820: %v\n", err)
+		fmt.Println("This may indicate another WireGuard service is running")
+	} else {
+		fmt.Println("Successfully bound to UDP port 51820")
+		conn.Close()
+	}
+
+	// 6. Check STUN connectivity
+	fmt.Println("\n6. STUN Connectivity")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	endpoint, err := natDiscovery.DiscoverPublicEndpoint(ctx)
+	if err != nil {
+		fmt.Printf("STUN discovery failed: %v\n", err)
+	} else {
+		fmt.Printf("Public endpoint according to STUN: %s\n", endpoint.String())
+		fmt.Println("NAT discovery is working correctly")
+	}
+
+	// 7. Check DNS resolution
+	fmt.Println("\n7. DNS Resolution")
+	nsLookupCmd := exec.Command("nslookup", "google.com")
+	output, err = nsLookupCmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("DNS resolution failed: %v\n", err)
+	} else {
+		fmt.Printf("%s\n", string(output))
+	}
+
+	fmt.Println("\n=== Diagnostic Summary ===")
+	fmt.Println("The diagnostics above can help identify network connectivity issues.")
+	fmt.Println("If you're having trouble connecting to peers, look for:")
+	fmt.Println("1. Firewall rules blocking UDP traffic")
+	fmt.Println("2. Multiple WireGuard interfaces causing conflicts")
+	fmt.Println("3. NAT type restrictions (symmetric NAT can cause issues)")
+	fmt.Println("4. Routing table conflicts")
+
+	fmt.Println("\nFor better connection success:")
+	fmt.Println("- Try using --retry=3 --timeout=30 for difficult connections")
+	fmt.Println("- Ensure UDP port 51820 (or your configured port) is forwarded if behind NAT")
+	fmt.Println("- Disable any VPN services that might interfere with WireGuard")
 }

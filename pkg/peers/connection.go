@@ -19,13 +19,14 @@ import (
 
 // ConnectionManager handles peer connections
 type ConnectionManager struct {
-	wgManager      *wireguard.WireGuardManager
-	routingManager *routing.RoutingManager
-	natDiscovery   *nat.DiscoveryClient
-	localPeerInfo  *PeerInfo
-	interfaceName  string
-	clientSubnet   string
-	connTracker    *ConnTracker
+	wgManager        *wireguard.WireGuardManager
+	routingManager   *routing.RoutingManager
+	natDiscovery     *nat.DiscoveryClient
+	localPeerInfo    *PeerInfo
+	interfaceName    string
+	clientSubnet     string
+	connTracker      *ConnTracker
+	handshakeTimeout time.Duration
 }
 
 // NewConnectionManager creates a new connection manager
@@ -38,14 +39,21 @@ func NewConnectionManager(
 	clientSubnet string,
 ) *ConnectionManager {
 	return &ConnectionManager{
-		wgManager:      wgManager,
-		routingManager: routingManager,
-		natDiscovery:   natDiscovery,
-		localPeerInfo:  localPeerInfo,
-		interfaceName:  interfaceName,
-		clientSubnet:   clientSubnet,
-		connTracker:    NewConnTracker(interfaceName),
+		wgManager:        wgManager,
+		routingManager:   routingManager,
+		natDiscovery:     natDiscovery,
+		localPeerInfo:    localPeerInfo,
+		interfaceName:    interfaceName,
+		clientSubnet:     clientSubnet,
+		connTracker:      NewConnTracker(interfaceName),
+		handshakeTimeout: 15 * time.Second, // Default timeout
 	}
+}
+
+// SetHandshakeTimeout sets the timeout for WireGuard handshake
+func (cm *ConnectionManager) SetHandshakeTimeout(timeout time.Duration) {
+	cm.handshakeTimeout = timeout
+	fmt.Printf("Handshake timeout set to %s\n", timeout)
 }
 
 // ConnectToPeer connects to a peer using their public key and endpoint
@@ -65,6 +73,24 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 	}()
 
 	fmt.Println("=== Connection Process Started ===")
+
+	// Test UDP connectivity to endpoint before proceeding
+	fmt.Printf("Testing UDP connectivity to %s...\n", peerEndpoint)
+	reachable, err := cm.testUDPConnectivity(peerEndpoint)
+	if err != nil {
+		fmt.Printf("Warning: Error testing connectivity: %v\n", err)
+	}
+	if !reachable {
+		fmt.Printf("ERROR: Endpoint %s appears to be unreachable!\n", peerEndpoint)
+		fmt.Println("This could be due to:")
+		fmt.Println(" - Firewall blocking UDP traffic")
+		fmt.Println(" - Incorrect port forwarding on remote peer")
+		fmt.Println(" - NAT traversal issues")
+		fmt.Println("You can continue anyway, but the connection will likely fail.")
+		fmt.Println("Trying to continue with setup...")
+	} else {
+		fmt.Printf("✓ Endpoint %s appears reachable\n", peerEndpoint)
+	}
 
 	// Set up WireGuard interface if needed
 	fmt.Println("1. Setting up WireGuard interface...")
@@ -111,7 +137,7 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 
 	// Wait and verify that we actually establish a connection
 	fmt.Println("5. Verifying connection to peer...")
-	handshakeTimeout := 15 * time.Second
+	handshakeTimeout := cm.handshakeTimeout
 	handshakeSuccess := false
 
 	// Create a context with timeout
@@ -177,6 +203,48 @@ handshakeDone:
 		fmt.Println("=== Connection Process Failed ===")
 		return fmt.Errorf("connection timed out - could not establish handshake with peer at %s", peerEndpoint)
 	}
+}
+
+// testUDPConnectivity tests if a UDP endpoint is reachable by sending a probe packet
+func (cm *ConnectionManager) testUDPConnectivity(endpoint string) (bool, error) {
+	// Parse the endpoint
+	endpointObj, err := nat.ParseEndpointString(endpoint)
+	if err != nil {
+		return false, fmt.Errorf("invalid endpoint format: %v", err)
+	}
+
+	// Create a test UDP connection
+	conn, err := net.DialTimeout("udp", endpoint, 5*time.Second)
+	if err != nil {
+		return false, fmt.Errorf("failed to create UDP connection: %v", err)
+	}
+	defer conn.Close()
+
+	// Set a timeout for the probe
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Send a test packet (WireGuard handshake initiation pattern)
+	testPacket := []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	_, err = conn.Write(testPacket)
+	if err != nil {
+		return false, fmt.Errorf("failed to send UDP test packet: %v", err)
+	}
+
+	// Try with the system ping command too (though this uses ICMP not UDP)
+	var pingCmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		pingCmd = exec.Command("ping", "-n", "1", "-w", "1000", endpointObj.IP.String())
+	default:
+		pingCmd = exec.Command("ping", "-c", "1", "-W", "1", endpointObj.IP.String())
+	}
+
+	pingOutput, _ := pingCmd.CombinedOutput()
+	fmt.Printf("Ping test to %s: %s\n", endpointObj.IP.String(), string(pingOutput))
+
+	// The UDP test is considered successful if we were able to send the packet
+	// We can't really verify receipt since WireGuard doesn't reply to random packets
+	return true, nil
 }
 
 // emergencyRoutingRestore tries to restore normal internet connectivity

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,18 +125,37 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 		}
 	}
 
+	// Get more detailed interface information
+	ifconfig, err := exec.Command("ifconfig", ct.interfaceName).CombinedOutput()
+	if err == nil {
+		fmt.Printf("\n=== Interface Status ===\n%s\n", string(ifconfig))
+	}
+
 	// Get UDP connection statistics (useful for seeing raw connection attempts)
-	connStats, err := exec.Command("netstat", "-u").CombinedOutput()
+	connStats, err := exec.Command("netstat", "-un").CombinedOutput()
 	if err == nil {
 		udpConns := strings.Split(string(connStats), "\n")
 		fmt.Println("\n=== UDP Connection Monitor ===")
 
 		// Filter for the WireGuard interface port
+		wgPort := 0
+		wgPortInfo, err := exec.Command(wgBinary, "show", ct.interfaceName, "listen-port").Output()
+		if err == nil {
+			portStr := strings.TrimSpace(string(wgPortInfo))
+			wgPort, _ = strconv.Atoi(portStr)
+			fmt.Printf("WireGuard listening on port: %d\n", wgPort)
+		}
+
 		var relevantLines []string
 		for _, line := range udpConns {
 			// Add all non-empty UDP connections with "wg" or the interface name or "*"
 			if strings.Contains(line, "udp") && (strings.Contains(line, "wg") ||
 				strings.Contains(line, ct.interfaceName) || strings.Contains(line, "*")) {
+				relevantLines = append(relevantLines, line)
+			}
+
+			// Also include lines with our port number if known
+			if wgPort > 0 && strings.Contains(line, fmt.Sprintf(":%d", wgPort)) {
 				relevantLines = append(relevantLines, line)
 			}
 		}
@@ -146,6 +166,26 @@ func (ct *ConnTracker) UpdateStats() []*PeerStats {
 			}
 		} else {
 			fmt.Println("No relevant UDP connections found")
+
+			// Extra diagnostics if we can't find UDP connections
+			fmt.Println("\n=== Connection Troubleshooting ===")
+			fmt.Println("Cannot find active UDP connections for WireGuard. This could be due to:")
+			fmt.Println("1. Firewall blocking incoming/outgoing UDP")
+			fmt.Println("2. No active WireGuard handshake attempts")
+			fmt.Println("3. Network interface issues")
+
+			// Try to check if general UDP traffic is working
+			fmt.Println("\nChecking general UDP connectivity...")
+
+			// Look for any UDP connections
+			allUDP, _ := exec.Command("netstat", "-un").CombinedOutput()
+			fmt.Printf("All UDP connections:\n%s\n", string(allUDP))
+
+			// Check firewall status on macOS
+			if runtime.GOOS == "darwin" {
+				pfStatus, _ := exec.Command("pfctl", "-s", "info").CombinedOutput()
+				fmt.Printf("\nFirewall status:\n%s\n", string(pfStatus))
+			}
 		}
 	}
 
