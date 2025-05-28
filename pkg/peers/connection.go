@@ -77,17 +77,11 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 	// Test UDP connectivity to endpoint before proceeding
 	fmt.Printf("Testing UDP connectivity to %s...\n", peerEndpoint)
 	reachable, err := cm.testUDPConnectivity(peerEndpoint)
-	if err != nil {
+	if err != nil && os.Getenv("PEERVPN_DEBUG") == "1" {
 		fmt.Printf("Warning: Error testing connectivity: %v\n", err)
 	}
 	if !reachable {
-		fmt.Printf("ERROR: Endpoint %s appears to be unreachable!\n", peerEndpoint)
-		fmt.Println("This could be due to:")
-		fmt.Println(" - Firewall blocking UDP traffic")
-		fmt.Println(" - Incorrect port forwarding on remote peer")
-		fmt.Println(" - NAT traversal issues")
-		fmt.Println("You can continue anyway, but the connection will likely fail.")
-		fmt.Println("Trying to continue with setup...")
+		fmt.Printf("⚠️  Endpoint %s may be unreachable (firewall/NAT issues possible)\n", peerEndpoint)
 	} else {
 		fmt.Printf("✓ Endpoint %s appears reachable\n", peerEndpoint)
 	}
@@ -145,44 +139,58 @@ func (cm *ConnectionManager) ConnectToPeer(peerPublicKey, peerEndpoint string) e
 	defer cancel()
 
 	// Check at regular intervals for a successful handshake
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) // Increased interval for more stability
 	defer ticker.Stop()
 
 	fmt.Printf("   Waiting up to %s for handshake with peer...\n", handshakeTimeout)
 
 	startTime := time.Now()
+
+	// Immediately try to initiate a handshake
+	fmt.Println("   Initiating handshake...")
+	if err := cm.initiateHandshake(peerPublicKey, peerEndpoint); err != nil {
+		fmt.Printf("   Warning: Failed to initiate handshake: %v\n", err)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			// Timeout occurred
 			if !handshakeSuccess {
-				// Do not set up routing, just clean up and exit
 				fmt.Println("   ✗ Connection timed out - no handshake with peer")
-				return fmt.Errorf("connection timed out - could not establish handshake with peer at %s", peerEndpoint)
+				return fmt.Errorf("connection timed out - could not establish handshake with peer at %s after %s", peerEndpoint, handshakeTimeout)
 			}
-			break
+			goto handshakeDone
 		case <-ticker.C:
 			// Check if we've established a handshake with this peer
 			connectedPeers := cm.connTracker.GetConnectedPeers()
+
 			for _, peer := range connectedPeers {
-				// Skip peers that haven't had a handshake or ones that have an empty endpoint
-				if peer.Endpoint == "" || peer.LastHandshake.IsZero() {
+				// Skip peers that haven't had a handshake
+				if peer.LastHandshake.IsZero() {
 					continue
 				}
 
-				// Check if this is a recent handshake
+				// Check if this is a recent handshake (within our monitoring window)
 				handshakeAge := time.Since(peer.LastHandshake)
-				if handshakeAge < handshakeTimeout {
-					fmt.Printf("   ✓ Handshake established with peer at %s (%s ago)\n", peer.Endpoint, handshakeAge.Round(time.Millisecond))
+
+				// Consider any handshake within the last 2 minutes as valid for this connection
+				if handshakeAge < 2*time.Minute {
+					fmt.Printf("   ✓ Handshake established with peer at %s (%s ago)\n", peer.Endpoint, handshakeAge.Round(time.Second))
 					handshakeSuccess = true
-					// Continue the connection process
 					goto handshakeDone
 				}
 			}
 
-			// Print progress indicator
+			// Print progress and try to re-initiate handshake periodically
 			elapsed := time.Since(startTime).Round(time.Second)
 			fmt.Printf("   Waiting for handshake: %s elapsed...\n", elapsed)
+
+			// Re-attempt handshake every 10 seconds
+			if elapsed.Seconds() > 0 && int(elapsed.Seconds())%10 == 0 {
+				fmt.Println("   Re-initiating handshake...")
+				cm.initiateHandshake(peerPublicKey, peerEndpoint)
+			}
 		}
 	}
 
@@ -239,8 +247,14 @@ func (cm *ConnectionManager) testUDPConnectivity(endpoint string) (bool, error) 
 		pingCmd = exec.Command("ping", "-c", "1", "-W", "1", endpointObj.IP.String())
 	}
 
-	pingOutput, _ := pingCmd.CombinedOutput()
-	fmt.Printf("Ping test to %s: %s\n", endpointObj.IP.String(), string(pingOutput))
+	// Only print ping result in debug mode
+	if os.Getenv("PEERVPN_DEBUG") == "1" {
+		pingOutput, _ := pingCmd.CombinedOutput()
+		fmt.Printf("Ping test to %s: %s\n", endpointObj.IP.String(), string(pingOutput))
+	} else {
+		// Just run the ping silently to test connectivity
+		pingCmd.Run()
+	}
 
 	// The UDP test is considered successful if we were able to send the packet
 	// We can't really verify receipt since WireGuard doesn't reply to random packets
@@ -368,9 +382,13 @@ func (cm *ConnectionManager) emergencyRoutingRestore() {
 	fmt.Println("If you still have connectivity issues, please restart your computer.")
 }
 
-// Disconnect disconnects from the VPN
+// Disconnect cleans up the VPN connection and restores network configuration
 func (cm *ConnectionManager) Disconnect() error {
 	var errors []string
+
+	// Stop NAT keepalive first
+	fmt.Println("Stopping NAT keepalive...")
+	cm.natDiscovery.StopNATKeepalive()
 
 	// First restore default route before cleaning up WireGuard
 	fmt.Println("Ensuring default route is restored...")
@@ -431,17 +449,13 @@ func (cm *ConnectionManager) DiscoverEndpoint(ctx context.Context) (string, erro
 	// Get the current port from WireGuard
 	wgPort := cm.wgManager.GetListenPort()
 
-	// Update STUN discovery port to match WireGuard if it changed
+	// CRITICAL FIX: Set STUN discovery port to match WireGuard BEFORE discovery
 	cm.natDiscovery.SetLocalPort(wgPort)
 
 	endpoint, err := cm.natDiscovery.DiscoverPublicEndpoint(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to discover public endpoint: %v", err)
 	}
-
-	// Do NOT override the discovered port - the port from STUN is what's actually
-	// visible from the internet and is the one peers should connect to
-	// Remove: endpoint.Port = wgPort
 
 	fmt.Printf("Local WireGuard port: %d, Public endpoint: %s\n", wgPort, endpoint.String())
 
@@ -492,6 +506,15 @@ func (cm *ConnectionManager) SetupExitNode() error {
 	// Update local peer info with the endpoint
 	cm.localPeerInfo.Endpoint = endpoint
 	cm.localPeerInfo.AllowedSubnets = cm.clientSubnet
+
+	// Start NAT keepalive to maintain port mapping even when no peers are connected
+	fmt.Println("Starting NAT keepalive to maintain port mapping...")
+	keepaliveCtx := context.Background() // Long-running context
+
+	// Start keepalive every 60 seconds (well before typical NAT timeouts)
+	// This is less frequent than WireGuard's persistent keepalive (25s) but more proactive
+	go cm.natDiscovery.StartNATKeepalive(keepaliveCtx, 60*time.Second)
+	fmt.Println("NAT keepalive started - your exit node will remain reachable even during idle periods")
 
 	// Start tracking connections immediately to detect peers
 	fmt.Println("Starting connection tracker...")
@@ -554,19 +577,18 @@ func (cm *ConnectionManager) StartConnectionTracking(interval time.Duration) {
 func (cm *ConnectionManager) DisplayPeerStats() {
 	peers := cm.connTracker.GetConnectedPeers()
 	if len(peers) == 0 {
-		fmt.Println("No peers connected")
+		// Only show this occasionally to avoid spamming
 		return
 	}
 
-	fmt.Println("\n=== Connected Peers ===")
+	fmt.Printf("[%s] 📈 Connected peers: %d\n", time.Now().Format("15:04:05"), len(peers))
 	for _, peer := range peers {
-		fmt.Printf("Peer: %s\n", peer.Endpoint)
-		fmt.Printf("  Last handshake: %s ago\n", formatDuration(time.Since(peer.LastHandshake)))
-		fmt.Printf("  Traffic: ↓ %s received, ↑ %s sent\n",
+		fmt.Printf("  • %s (↓%s ↑%s, last handshake %s ago)\n",
+			peer.Endpoint,
 			FormatTrafficBytes(peer.BytesReceived),
-			FormatTrafficBytes(peer.BytesSent))
+			FormatTrafficBytes(peer.BytesSent),
+			formatDuration(time.Since(peer.LastHandshake)))
 	}
-	fmt.Println("======================")
 }
 
 // StopConnectionTracking stops the connection tracker
@@ -662,4 +684,18 @@ func (cm *ConnectionManager) EnableConnectionDebugging() {
 			}
 		}
 	}()
+}
+
+// initiateHandshake manually triggers a WireGuard handshake with a peer
+func (cm *ConnectionManager) initiateHandshake(peerPublicKey, peerEndpoint string) error {
+	// Use the wg binary to set the peer endpoint, which should trigger a handshake
+	wgBinary := wireguard.BinaryPath("wg")
+	cmd := exec.Command(wgBinary, "set", cm.interfaceName, "peer", peerPublicKey, "endpoint", peerEndpoint)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to set peer endpoint: %v - %s", err, string(output))
+	}
+
+	return nil
 }

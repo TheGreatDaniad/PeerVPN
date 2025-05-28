@@ -100,117 +100,41 @@ func NewWireGuardManager(interfaceName string, privateKeyStr string, listenPort 
 		listenPort = 51820
 	}
 
-	// Check if the port is already in use, and find an available one if needed
+	// Simple port availability check and fallback
 	finalPort := listenPort
+	if !isPortAvailable(listenPort) {
+		fmt.Printf("Port %d is in use, finding alternative...\n", listenPort)
 
-	// Use direct UDP connection for testing instead of net.Listen
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", listenPort))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve UDP address: %v", err)
-	}
+		// Try a few common alternatives
+		alternatives := []int{51821, 51822, 51823, 41194, 1194}
+		found := false
 
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		fmt.Printf("Warning: Port %d is already in use, finding an available port...\n", listenPort)
-		fmt.Printf("Original error: %v\n", err)
-
-		// Try several different port ranges to increase our chances
-		portRanges := []struct{ start, end int }{
-			{30000, 30100}, // Try a completely different range
-			{40000, 40100}, // Try an even higher range
-			{10000, 10100}, // Try a lower range
-		}
-
-		foundPort := false
-		for _, r := range portRanges {
-			fmt.Printf("Trying port range %d-%d...\n", r.start, r.end)
-
-			for port := r.start; port < r.end; port++ {
-				udpAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", port))
-				if err != nil {
-					continue
-				}
-
-				conn, err = net.ListenUDP("udp", udpAddr)
-				if err == nil {
-					finalPort = port
-					conn.Close()
-					foundPort = true
-					fmt.Printf("Found available port: %d\n", finalPort)
-					break
-				}
-
-				// Print detailed error for first few ports to help diagnose
-				if port < r.start+3 {
-					fmt.Printf("  Port %d error: %v\n", port, err)
-				}
-			}
-
-			if foundPort {
+		for _, port := range alternatives {
+			if isPortAvailable(port) {
+				finalPort = port
+				found = true
+				fmt.Printf("Using alternative port: %d\n", finalPort)
 				break
 			}
 		}
 
-		// As a last resort, try a fixed high port that's unlikely to be used
-		if !foundPort {
-			fmt.Println("Trying fixed fallback port 37373...")
-			udpAddr, err = net.ResolveUDPAddr("udp", "0.0.0.0:37373")
-			if err == nil {
-				conn, err = net.ListenUDP("udp", udpAddr)
-				if err == nil {
-					finalPort = 37373
-					conn.Close()
-					foundPort = true
-					fmt.Printf("Fallback port 37373 is available\n")
-				} else {
-					fmt.Printf("Fallback port error: %v\n", err)
+		if !found {
+			// Find any available port in a reasonable range
+			for port := 30000; port <= 35000; port++ {
+				if isPortAvailable(port) {
+					finalPort = port
+					found = true
+					fmt.Printf("Using available port: %d\n", finalPort)
+					break
 				}
 			}
 		}
 
-		// If even that fails, let's try binding to localhost instead of 0.0.0.0
-		if !foundPort {
-			fmt.Println("Trying to bind to localhost:30000 as last resort...")
-			udpAddr, err = net.ResolveUDPAddr("udp", "127.0.0.1:30000")
-			if err == nil {
-				conn, err = net.ListenUDP("udp", udpAddr)
-				if err == nil {
-					finalPort = 30000
-					conn.Close()
-					foundPort = true
-					fmt.Printf("Localhost port 30000 is available\n")
-				} else {
-					fmt.Printf("Localhost port error: %v\n", err)
-				}
-			}
-		}
-
-		if !foundPort {
-			// Get network interface information for debugging
-			fmt.Println("Debugging network interfaces:")
-			ifcs, err := net.Interfaces()
-			if err == nil {
-				for _, ifc := range ifcs {
-					fmt.Printf("Interface %v: %v\n", ifc.Name, ifc.Flags)
-				}
-			}
-
-			// Check if we have permission to bind to ports
-			fmt.Println("Checking system capabilities...")
-			output, err := exec.Command("id").CombinedOutput()
-			if err == nil {
-				fmt.Printf("User info: %s\n", string(output))
-			}
-
-			// As absolute last resort, just use a hardcoded port and hope for the best
-			fmt.Println("NOTICE: Failed to find available port. Using hardcoded port 41414.")
-			fmt.Println("If WireGuard fails to start, you may need to manually specify a port.")
-			finalPort = 41414
+		if !found {
+			return nil, fmt.Errorf("could not find any available UDP port for WireGuard")
 		}
 	} else {
-		// The port is available, close the connection
-		conn.Close()
-		fmt.Printf("Confirmed port %d is available\n", finalPort)
+		fmt.Printf("Using requested port: %d\n", finalPort)
 	}
 
 	return &WireGuardManager{
@@ -219,6 +143,21 @@ func NewWireGuardManager(interfaceName string, privateKeyStr string, listenPort 
 		listenPort:    finalPort,
 		addresses:     addresses,
 	}, nil
+}
+
+// isPortAvailable checks if a UDP port is available
+func isPortAvailable(port int) bool {
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // GetPrivateKey returns the private key as a string
@@ -234,6 +173,60 @@ func (wg *WireGuardManager) GetPublicKey() string {
 // GetListenPort returns the current listening port
 func (wg *WireGuardManager) GetListenPort() int {
 	return wg.listenPort
+}
+
+// VerifyDependencies checks if required WireGuard tools are available
+func VerifyDependencies() error {
+	// Check for wg binary
+	wgBinary := BinaryPath("wg")
+	if _, err := exec.LookPath(wgBinary); err != nil {
+		// Try to find wg in PATH as fallback
+		if _, err := exec.LookPath("wg"); err != nil {
+			return fmt.Errorf("WireGuard 'wg' binary not found. Please install WireGuard tools")
+		}
+	}
+
+	// Test if wg binary actually works
+	cmd := exec.Command(wgBinary, "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("WireGuard binary test failed: %v - %s", err, string(output))
+	}
+
+	fmt.Printf("WireGuard tools verified: %s\n", strings.TrimSpace(string(output)))
+
+	// Platform-specific checks
+	switch runtime.GOOS {
+	case "darwin":
+		// Check for wireguard-go
+		wgGoBinary := BinaryPath("wireguard-go")
+		if _, err := exec.LookPath(wgGoBinary); err != nil {
+			if _, err := exec.LookPath("wireguard-go"); err != nil {
+				return fmt.Errorf("WireGuard-go binary not found. Please install: brew install wireguard-tools")
+			}
+		}
+
+		// Test wireguard-go
+		cmd := exec.Command(wgGoBinary, "--version")
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("Warning: wireguard-go test failed: %v\n", err)
+		}
+
+	case "linux":
+		// Check if WireGuard kernel module is available
+		if _, err := os.Stat("/sys/module/wireguard"); err != nil {
+			fmt.Println("Warning: WireGuard kernel module not detected. Make sure WireGuard is installed.")
+		}
+
+	case "windows":
+		// On Windows, we need the WireGuard service
+		wgBinary := BinaryPath("wireguard")
+		if _, err := exec.LookPath(wgBinary); err != nil {
+			return fmt.Errorf("WireGuard Windows binary not found. Please install WireGuard for Windows")
+		}
+	}
+
+	return nil
 }
 
 // SetupInterface creates and configures the WireGuard interface

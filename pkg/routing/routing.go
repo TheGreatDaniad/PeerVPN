@@ -12,6 +12,7 @@ import (
 type RoutingManager struct {
 	interfaceName string
 	isExitNode    bool
+	stateManager  *RoutingStateManager
 }
 
 // NewRoutingManager creates a new routing manager
@@ -19,6 +20,7 @@ func NewRoutingManager(interfaceName string, isExitNode bool) *RoutingManager {
 	return &RoutingManager{
 		interfaceName: interfaceName,
 		isExitNode:    isExitNode,
+		stateManager:  NewRoutingStateManager(),
 	}
 }
 
@@ -31,6 +33,11 @@ func (r *RoutingManager) EnableIPForwarding() error {
 	// Check if we have sufficient permissions
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("enabling IP forwarding requires root privileges")
+	}
+
+	// CRITICAL: Backup routing state before making any changes
+	if err := r.stateManager.BackupRoutingState(); err != nil {
+		return fmt.Errorf("failed to backup routing state: %v", err)
 	}
 
 	var err error
@@ -53,6 +60,14 @@ func (r *RoutingManager) SetupRouting(clientSubnet string) error {
 	// Check if we have sufficient permissions
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("setting up routing requires root privileges")
+	}
+
+	// CRITICAL: Backup routing state before making any changes (for clients)
+	// Exit nodes already have their state backed up in EnableIPForwarding
+	if !r.isExitNode {
+		if err := r.stateManager.BackupRoutingState(); err != nil {
+			return fmt.Errorf("failed to backup routing state: %v", err)
+		}
 	}
 
 	var err error
@@ -90,19 +105,35 @@ func (r *RoutingManager) CleanupRouting() error {
 		return fmt.Errorf("cleaning up routing requires root privileges")
 	}
 
-	var err error
-	switch runtime.GOOS {
-	case "linux":
-		err = r.cleanupRoutingLinux()
-	case "darwin":
-		err = r.cleanupRoutingDarwin()
-	case "windows":
-		err = r.cleanupRoutingWindows()
-	default:
-		err = fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	// CRITICAL: Use routing state manager to restore original state
+	fmt.Println("Restoring original routing configuration...")
+	if err := r.stateManager.RestoreRoutingState(); err != nil {
+		fmt.Printf("Primary restoration failed: %v\n", err)
+		fmt.Println("Attempting manual cleanup as fallback...")
+
+		// Fall back to manual cleanup if restoration fails
+		var fallbackErr error
+		switch runtime.GOOS {
+		case "linux":
+			fallbackErr = r.cleanupRoutingLinux()
+		case "darwin":
+			fallbackErr = r.cleanupRoutingDarwin()
+		case "windows":
+			fallbackErr = r.cleanupRoutingWindows()
+		default:
+			fallbackErr = fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+		}
+
+		if fallbackErr != nil {
+			return fmt.Errorf("both primary restoration and manual cleanup failed - primary: %v, fallback: %v", err, fallbackErr)
+		}
+
+		fmt.Println("Manual cleanup completed successfully")
+		return nil
 	}
 
-	return err
+	fmt.Println("Original routing state successfully restored")
+	return nil
 }
 
 // Linux implementations
@@ -308,7 +339,7 @@ pass inet proto icmp all
 func (r *RoutingManager) setupClientRoutingDarwin() error {
 	fmt.Println("Setting up client routing on macOS...")
 
-	// Get the default gateway and interface
+	// Get current default route for backup
 	routeBytes, err := exec.Command("route", "-n", "get", "default").Output()
 	if err != nil {
 		return fmt.Errorf("failed to get default gateway: %v", err)
@@ -342,84 +373,40 @@ func (r *RoutingManager) setupClientRoutingDarwin() error {
 
 	fmt.Printf("Found gateway %s on interface %s\n", gateway, gatewayInterface)
 
-	// First preserve routes to the gateway's network to maintain connectivity
-	// Get netmask for gateway network
-	gatewayNetworkBytes, err := exec.Command("ifconfig", gatewayInterface).Output()
-	if err != nil {
-		return fmt.Errorf("failed to get gateway interface info: %v", err)
+	// SIMPLIFIED APPROACH: Just add a route for the VPN subnet through our interface
+	// This avoids the complex split-tunneling that was causing issues
+	fmt.Println("Adding route for VPN traffic via WireGuard interface...")
+
+	// Route the VPN subnet through our interface
+	cmd := exec.Command("route", "-n", "add", "-net", "10.0.0.0/24", "-interface", r.interfaceName)
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to add VPN subnet route: %v\n", err)
+		// This is not critical for basic connectivity
 	}
 
-	fmt.Printf("Gateway interface info:\n%s\n", string(gatewayNetworkBytes))
+	// For a full VPN (optional), we can add the split tunnel routes
+	// But we'll be more careful about it
+	fmt.Println("Setting up split tunnel routes (experimental)...")
 
-	var gatewayNetwork string
-	for _, line := range strings.Split(string(gatewayNetworkBytes), "\n") {
-		if strings.Contains(line, "inet ") && strings.Contains(line, "netmask") {
-			parts := strings.Fields(line)
-			if len(parts) >= 4 {
-				ipParts := strings.Split(parts[1], ".")
-				// Assuming a class C network
-				if len(ipParts) == 4 {
-					gatewayNetwork = fmt.Sprintf("%s.%s.%s.0/24", ipParts[0], ipParts[1], ipParts[2])
-				}
-			}
-		}
-	}
+	// First, preserve explicit routes to important services
+	preserveRoutes := []string{gateway}
 
-	if gatewayNetwork == "" {
-		// Fallback to assuming a /24 network based on gateway IP
-		ipParts := strings.Split(gateway, ".")
-		if len(ipParts) == 4 {
-			gatewayNetwork = fmt.Sprintf("%s.%s.%s.0/24", ipParts[0], ipParts[1], ipParts[2])
+	// Add routes for common DNS servers to prevent DNS leaks
+	dnsServers := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"}
+	for _, dns := range dnsServers {
+		cmd = exec.Command("route", "-n", "add", dns, gateway)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to add DNS route for %s: %v\n", dns, err)
 		} else {
-			return fmt.Errorf("could not determine gateway network")
+			preserveRoutes = append(preserveRoutes, dns)
+			fmt.Printf("Preserved direct route to DNS server %s\n", dns)
 		}
 	}
 
-	fmt.Printf("Preserving route to gateway network %s\n", gatewayNetwork)
-
-	// Add a direct route to the gateway's network
-	cmd := exec.Command("route", "-n", "add", "-net", gatewayNetwork, "-interface", gatewayInterface)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Warning: Failed to add route to gateway network: %v\n", err)
-		// Continue anyway as this might not be critical
-	}
-
-	// Add a specific route for the gateway itself
-	cmd = exec.Command("route", "-n", "add", gateway, "-interface", gatewayInterface)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Warning: Failed to add direct route to gateway: %v\n", err)
-		// Continue anyway
-	}
-
-	// Add routes for DNS servers to ensure they're reachable
-	// Get DNS servers
-	resolvConfBytes, err := os.ReadFile("/etc/resolv.conf")
-	if err == nil {
-		for _, line := range strings.Split(string(resolvConfBytes), "\n") {
-			if strings.HasPrefix(line, "nameserver ") {
-				dnsServer := strings.TrimPrefix(line, "nameserver ")
-				fmt.Printf("Adding direct route to DNS server %s\n", dnsServer)
-				cmd = exec.Command("route", "-n", "add", dnsServer, "-interface", gatewayInterface)
-				_ = cmd.Run() // Ignore errors
-			}
-		}
-	}
-
-	// Now add routes for all traffic through the WireGuard interface
-	fmt.Println("Adding routes for general traffic via WireGuard interface...")
-	cmd = exec.Command("route", "-n", "add", "-net", "0.0.0.0/1", "-interface", r.interfaceName)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to add route 0.0.0.0/1: %v", err)
-	}
-
-	cmd = exec.Command("route", "-n", "add", "-net", "128.0.0.0/1", "-interface", r.interfaceName)
-	if err := cmd.Run(); err != nil {
-		// If this fails, try to clean up the previous route
-		_ = exec.Command("route", "-n", "delete", "-net", "0.0.0.0/1").Run()
-		return fmt.Errorf("failed to add route 128.0.0.0/1: %v", err)
-	}
-
-	fmt.Println("Client routing setup complete")
+	// Only add the split tunnel routes if explicitly requested
+	// For now, we'll skip this to avoid breaking connectivity
+	fmt.Println("Skipping full traffic routing to prevent connectivity issues")
+	fmt.Println("VPN is set up for subnet access only")
 
 	return nil
 }

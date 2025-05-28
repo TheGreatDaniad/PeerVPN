@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -80,6 +81,8 @@ func main() {
 		connTimeout int
 		retryCount  int
 		diagnostics bool
+		natTest     bool
+		monitorNAT  bool
 	)
 
 	flag.BoolVar(&isExitNode, "exit", false, "Run as an exit node")
@@ -89,11 +92,30 @@ func main() {
 	flag.IntVar(&connTimeout, "timeout", 15, "Connection handshake timeout in seconds")
 	flag.IntVar(&retryCount, "retry", 1, "Number of connection attempts before giving up")
 	flag.BoolVar(&diagnostics, "diagnostics", false, "Run network diagnostics to troubleshoot connectivity issues")
+	flag.BoolVar(&natTest, "nattest", false, "Test NAT type and P2P connectivity capabilities")
+	flag.BoolVar(&monitorNAT, "monitor-nat", false, "Enable frequent NAT monitoring (logs public endpoint every 10 seconds)")
 	flag.Parse()
 
 	// Create config directory if it doesn't exist
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		fmt.Printf("Error creating config directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Verify WireGuard dependencies before proceeding
+	fmt.Println("Verifying WireGuard dependencies...")
+	if err := wireguard.VerifyDependencies(); err != nil {
+		fmt.Printf("Dependency check failed: %v\n", err)
+		fmt.Println("\nInstallation instructions:")
+		switch runtime.GOOS {
+		case "darwin":
+			fmt.Println("  brew install wireguard-tools")
+		case "linux":
+			fmt.Println("  sudo apt install wireguard-tools  # Ubuntu/Debian")
+			fmt.Println("  sudo yum install wireguard-tools  # RHEL/CentOS")
+		case "windows":
+			fmt.Println("  Download and install WireGuard from https://www.wireguard.com/install/")
+		}
 		os.Exit(1)
 	}
 
@@ -134,6 +156,13 @@ func main() {
 	if diagnostics {
 		fmt.Println("=== PeerVPN Network Diagnostics ===")
 		runNetworkDiagnostics(connectionManager, natDiscovery)
+		os.Exit(0)
+	}
+
+	// Handle NAT testing mode
+	if natTest {
+		fmt.Println("=== PeerVPN NAT Type Detection ===")
+		runNATTypeDetection(cfg)
 		os.Exit(0)
 	}
 
@@ -186,9 +215,57 @@ func main() {
 			connectionManager.EnableConnectionDebugging()
 		}
 
-		// Set up signal handling
+		// Enable NAT monitoring if requested
+		if monitorNAT {
+			fmt.Println("\nNAT monitoring enabled - public endpoint will be logged every 10 seconds")
+			fmt.Println("This helps verify that your exit node port remains accessible over time")
+			ctx := context.Background()
+			natDiscovery.StartNATMonitoring(ctx, 10*time.Second)
+		}
+
+		// Set up signal handling with cleanup protection
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+		// Create cleanup function that ensures routing state is restored
+		var cleanupInProgress bool
+		var cleanupMutex sync.Mutex
+		cleanup := func() {
+			cleanupMutex.Lock()
+			defer cleanupMutex.Unlock()
+
+			if cleanupInProgress {
+				return // Cleanup already in progress, avoid double execution
+			}
+			cleanupInProgress = true
+
+			fmt.Println("\nShutting down and restoring network state...")
+			fmt.Println("Please wait, do not interrupt (Ctrl+C again will be ignored)...")
+
+			// Mask additional signals during cleanup to prevent interruption
+			signal.Stop(sigCh)
+			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+
+			// Stop tracking before disconnecting
+			connectionManager.StopConnectionTracking()
+
+			// Clean up (this will restore routing state)
+			if err := connectionManager.Disconnect(); err != nil {
+				fmt.Printf("Error during cleanup: %v\n", err)
+
+				// Emergency fallback: try direct routing restoration
+				fmt.Println("Attempting emergency routing restoration...")
+				if err := exec.Command("sudo", "./emergency_recovery.sh").Run(); err != nil {
+					fmt.Printf("Emergency recovery script failed: %v\n", err)
+					fmt.Println("Manual intervention may be required to restore network connectivity")
+				}
+			}
+
+			fmt.Println("Network state restored, safe to exit.")
+		}
+
+		// Set up deferred cleanup to run on any exit
+		defer cleanup()
 
 		// Start tracking connections
 		fmt.Println("\nWaiting for peer connections...")
@@ -211,18 +288,35 @@ func main() {
 			}
 		}()
 
-		// Wait for termination signal
+		// Signal handling loop with cleanup protection
+		go func() {
+			signalCount := 0
+			for sig := range sigCh {
+				signalCount++
+
+				cleanupMutex.Lock()
+				inProgress := cleanupInProgress
+				cleanupMutex.Unlock()
+
+				if inProgress {
+					if signalCount == 1 {
+						fmt.Printf("\nReceived %v, cleanup in progress...\n", sig)
+						fmt.Println("Please wait for network restoration to complete.")
+						fmt.Println("Forcing exit now may leave your network in a broken state!")
+					} else {
+						fmt.Printf("\nReceived %v again - cleanup still in progress, please wait...\n", sig)
+					}
+					continue
+				}
+
+				// First signal received, start graceful shutdown
+				fmt.Printf("\nReceived %v, starting graceful shutdown...\n", sig)
+				break
+			}
+		}()
+
+		// Wait for first termination signal
 		<-sigCh
-		fmt.Println("\nShutting down...")
-
-		// Stop tracking before disconnecting
-		connectionManager.StopConnectionTracking()
-
-		// Clean up
-		if err := connectionManager.Disconnect(); err != nil {
-			fmt.Printf("Error during cleanup: %v\n", err)
-			os.Exit(1)
-		}
 
 		// Wait for stats goroutine to finish
 		<-statsDone
@@ -259,6 +353,13 @@ func main() {
 			connectionManager.EnableConnectionDebugging()
 		}
 
+		// Enable NAT monitoring if requested
+		if monitorNAT {
+			fmt.Println("\nNAT monitoring enabled - will monitor your public endpoint during connection")
+			ctx := context.Background()
+			natDiscovery.StartNATMonitoring(ctx, 10*time.Second)
+		}
+
 		// Attempt connection with retries
 		var connectErr error
 		for attempt := 1; attempt <= retryCount; attempt++ {
@@ -282,19 +383,74 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Set up signal handling
+		// Set up signal handling with cleanup protection
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+		// Create cleanup function that ensures routing state is restored
+		var cleanupInProgress bool
+		var cleanupMutex sync.Mutex
+		cleanup := func() {
+			cleanupMutex.Lock()
+			defer cleanupMutex.Unlock()
+
+			if cleanupInProgress {
+				return // Cleanup already in progress, avoid double execution
+			}
+			cleanupInProgress = true
+
+			fmt.Println("\nShutting down and restoring network state...")
+			fmt.Println("Please wait, do not interrupt (Ctrl+C again will be ignored)...")
+
+			// Mask additional signals during cleanup to prevent interruption
+			signal.Stop(sigCh)
+			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+
+			// Clean up (this will restore routing state)
+			if err := connectionManager.Disconnect(); err != nil {
+				fmt.Printf("Error during cleanup: %v\n", err)
+
+				// Emergency fallback: try direct routing restoration
+				fmt.Println("Attempting emergency routing restoration...")
+				if err := exec.Command("sudo", "./emergency_recovery.sh").Run(); err != nil {
+					fmt.Printf("Emergency recovery script failed: %v\n", err)
+					fmt.Println("Manual intervention may be required to restore network connectivity")
+				}
+			}
+		}
+
+		// Set up deferred cleanup to run on any exit
+		defer cleanup()
+
+		// Signal handling loop with cleanup protection
+		go func() {
+			signalCount := 0
+			for sig := range sigCh {
+				signalCount++
+
+				cleanupMutex.Lock()
+				inProgress := cleanupInProgress
+				cleanupMutex.Unlock()
+
+				if inProgress {
+					if signalCount == 1 {
+						fmt.Printf("\nReceived %v, cleanup in progress...\n", sig)
+						fmt.Println("Please wait for network restoration to complete.")
+						fmt.Println("Forcing exit now may leave your network in a broken state!")
+					} else {
+						fmt.Printf("\nReceived %v again - cleanup still in progress, please wait...\n", sig)
+					}
+					continue
+				}
+
+				// First signal received, start graceful shutdown
+				fmt.Printf("\nReceived %v, starting graceful shutdown...\n", sig)
+				break
+			}
+		}()
+
 		// Wait for termination signal
 		<-sigCh
-		fmt.Println("\nShutting down...")
-
-		// Clean up
-		if err := connectionManager.Disconnect(); err != nil {
-			fmt.Printf("Error during cleanup: %v\n", err)
-			os.Exit(1)
-		}
 
 		fmt.Println("Disconnected successfully.")
 	} else {
@@ -306,7 +462,10 @@ func main() {
 		fmt.Println("     --timeout=N      Set handshake timeout in seconds (default: 15)")
 		fmt.Println("     --retry=N        Number of connection attempts (default: 1)")
 		fmt.Println("     --debug          Enable detailed connection information")
+		fmt.Println("     --monitor-nat    Log public endpoint every 10 seconds (test port persistence)")
 		fmt.Println("Use --info to show your connection information")
+		fmt.Println("Use --nattest to test your NAT type and P2P connectivity")
+		fmt.Println("Use --diagnostics to run full network diagnostics")
 		os.Exit(0)
 	}
 }
@@ -458,4 +617,95 @@ func runNetworkDiagnostics(cm *peers.ConnectionManager, natDiscovery *nat.Discov
 	fmt.Println("- Try using --retry=3 --timeout=30 for difficult connections")
 	fmt.Println("- Ensure UDP port 51820 (or your configured port) is forwarded if behind NAT")
 	fmt.Println("- Disable any VPN services that might interfere with WireGuard")
+}
+
+// runNATTypeDetection performs NAT type detection and connectivity analysis
+func runNATTypeDetection(cfg *config.Config) {
+	fmt.Println("This will test your network's NAT type and P2P connectivity capabilities.")
+	fmt.Println("Understanding your NAT type helps determine:")
+	fmt.Println("• Whether you can act as an exit node")
+	fmt.Println("• How easily others can connect to you")
+	fmt.Println("• What connection issues you might encounter")
+	fmt.Println("")
+
+	// Create NAT type detector
+	detector := nat.NewNATTypeDetector(cfg.StunServers)
+
+	// Run detection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	natType, endpoints, err := detector.DetectNATType(ctx)
+	if err != nil {
+		fmt.Printf("❌ NAT detection failed: %v\n", err)
+		return
+	}
+
+	// Display results
+	fmt.Println("\n" + strings.Repeat("=", 50))
+	fmt.Printf("🌐 NAT Type: %s\n", natType.String())
+	fmt.Printf("📊 P2P Compatibility: %s\n", natType.GetCompatibilityLevel())
+	fmt.Println(strings.Repeat("=", 50))
+
+	// Show discovered endpoints
+	if len(endpoints) > 0 {
+		fmt.Println("\n📍 Discovered External Endpoints:")
+		for i, endpoint := range endpoints {
+			fmt.Printf("   %d. %s\n", i+1, endpoint.String())
+		}
+	}
+
+	// Show recommendations
+	fmt.Println("\n💡 Recommendations:")
+	recommendations := natType.GetRecommendations()
+	for _, rec := range recommendations {
+		fmt.Printf("   %s\n", rec)
+	}
+
+	// Provide specific guidance based on NAT type
+	fmt.Println("\n📋 What This Means for PeerVPN:")
+
+	switch natType {
+	case nat.NATTypeOpen, nat.NATTypeFullCone:
+		fmt.Println("✅ Excellent for PeerVPN!")
+		fmt.Println("   • You can easily run as an exit node")
+		fmt.Println("   • Others can connect to you reliably")
+		fmt.Println("   • You can connect to most other peers")
+
+	case nat.NATTypeRestrictedCone, nat.NATTypePortRestrictedCone:
+		fmt.Println("⚠️  Good for PeerVPN with some limitations")
+		fmt.Println("   • You can run as an exit node, but may need port forwarding")
+		fmt.Println("   • You can connect to most peers")
+		fmt.Println("   • Some peers behind strict NAT may have trouble connecting to you")
+
+	case nat.NATTypeSymmetric:
+		fmt.Println("❌ Poor for PeerVPN")
+		fmt.Println("   • You should NOT run as an exit node (others can't reliably connect)")
+		fmt.Println("   • You can only connect to peers with open/cone NAT")
+		fmt.Println("   • Consider using a VPS or different network for better results")
+
+	case nat.NATTypeBlocked:
+		fmt.Println("🚫 Cannot use PeerVPN")
+		fmt.Println("   • UDP traffic appears blocked")
+		fmt.Println("   • Check firewall and router settings")
+		fmt.Println("   • Try a different network")
+	}
+
+	// Additional network information
+	fmt.Println("\n🔧 Network Configuration Help:")
+	fmt.Println("If you want to improve your P2P connectivity:")
+	fmt.Println("")
+	fmt.Println("Router Settings:")
+	fmt.Println("• Enable UPnP (Universal Plug and Play)")
+	fmt.Println("• Forward UDP port 51820 to your computer's IP")
+	fmt.Println("• Disable SIP ALG if available (can interfere with UDP)")
+	fmt.Println("")
+	fmt.Println("Firewall Settings:")
+	fmt.Println("• Allow incoming UDP traffic on port 51820")
+	fmt.Println("• Allow outgoing UDP traffic to any port")
+	fmt.Println("")
+	fmt.Println("If on corporate/school network:")
+	fmt.Println("• Symmetric NAT is common on enterprise networks")
+	fmt.Println("• Try using mobile hotspot or home network instead")
+	fmt.Println("• Contact IT department about UDP port access")
 }
